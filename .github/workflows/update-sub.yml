@@ -1,0 +1,47 @@
+name: Update VPN subscription
+
+on:
+  schedule:
+    - cron: "0 */6 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: update-vpn-subscription
+  cancel-in-progress: false
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out main
+        uses: actions/checkout@v4
+        with:
+          ref: main
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+
+      - name: Test subscription parser
+        run: python -m unittest discover -s .github/scripts -p "test_*.py"
+
+      - name: Fetch and encode subscription
+        env:
+          VPN_SOURCE_URLS: ${{ vars.VPN_SOURCE_URLS }}
+        run: python .github/scripts/update_sub.py sub.txt
+
+      - name: Commit and push subscription when changed
+        run: |
+          git add -- sub.txt
+          if git diff --cached --quiet -- sub.txt; then
+            echo "Subscription is unchanged."
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit -m "Update VPN subscription"
+          git push origin HEAD:main
