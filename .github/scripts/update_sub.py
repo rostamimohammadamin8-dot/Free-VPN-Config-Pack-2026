@@ -3,19 +3,20 @@
 
 import base64
 import binascii
+import http.client
 import ipaddress
 import json
 import os
 import re
 import socket
+import ssl
 import sys
-from urllib.error import HTTPError, URLError
-from urllib.parse import urlsplit
-from urllib.request import HTTPRedirectHandler, Request, build_opener
+from urllib.parse import quote, urljoin, urlsplit
 
 MAX_FEED_BYTES = 5 * 1024 * 1024
 MAX_SOURCES = 100
 FETCH_TIMEOUT_SECONDS = 20
+MAX_REDIRECTS = 5
 SUPPORTED_SCHEMES = {
     "http",
     "https",
@@ -164,7 +165,7 @@ def _extract_nodes(content):
     return lines
 
 
-def _validate_public_https_url(url):
+def _resolve_public_https_url(url):
     try:
         parsed = urlsplit(url)
         if (
@@ -182,33 +183,110 @@ def _validate_public_https_url(url):
         try:
             addresses = [ipaddress.ip_address(host)]
         except ValueError:
-            addresses = [
-                ipaddress.ip_address(result[4][0].split("%", 1)[0])
-                for result in socket.getaddrinfo(host, parsed.port or 443, type=socket.SOCK_STREAM)
-            ]
+            addresses = []
+            for result in socket.getaddrinfo(
+                host, parsed.port or 443, type=socket.SOCK_STREAM
+            ):
+                address = ipaddress.ip_address(result[4][0].split("%", 1)[0])
+                if address not in addresses:
+                    addresses.append(address)
         if not addresses or any(not address.is_global for address in addresses):
             raise ValueError
-        return parsed
+        return parsed, [str(address) for address in addresses]
     except (OSError, UnicodeError, ValueError):
         raise SubscriptionError("source URL must resolve only to public HTTPS addresses") from None
 
 
-class _HTTPSOnlyRedirectHandler(HTTPRedirectHandler):
-    def redirect_request(self, request, response, code, message, headers, new_url):
-        _validate_public_https_url(new_url)
-        return super().redirect_request(request, response, code, message, headers, new_url)
+def _validate_public_https_url(url):
+    return _resolve_public_https_url(url)[0]
+
+
+class _PinnedHTTPSConnection(http.client.HTTPSConnection):
+    def __init__(self, hostname, address, port, timeout):
+        super().__init__(
+            hostname,
+            port,
+            timeout=timeout,
+            context=ssl.create_default_context(),
+        )
+        self._connect_address = address
+
+    def connect(self):
+        raw_socket = socket.create_connection(
+            (self._connect_address, self.port),
+            self.timeout,
+            self.source_address,
+        )
+        self.sock = self._context.wrap_socket(raw_socket, server_hostname=self.host)
+
+
+def _fetch_url(url):
+    current_url = url
+    for redirect_count in range(MAX_REDIRECTS + 1):
+        parsed, addresses = _resolve_public_https_url(current_url)
+        hostname = parsed.hostname.encode("idna").decode("ascii")
+        port = parsed.port or 443
+        target = quote(parsed.path or "/", safe="/%:@!$&'()*+,;=-._~")
+        if parsed.query:
+            target += "?" + quote(parsed.query, safe="/?@!$&'()*+,;=:-._~")
+        host_header = f"[{hostname}]" if ":" in hostname else hostname
+        if port != 443:
+            host_header += f":{port}"
+
+        last_error = None
+        response = None
+        connection = None
+        for address in addresses:
+            connection = _PinnedHTTPSConnection(
+                hostname, address, port, FETCH_TIMEOUT_SECONDS
+            )
+            try:
+                connection.request(
+                    "GET",
+                    target,
+                    headers={
+                        "Host": host_header,
+                        "User-Agent": "VPN-Subscription-Sync/1.0",
+                        "Connection": "close",
+                    },
+                )
+                response = connection.getresponse()
+                break
+            except (OSError, ssl.SSLError, http.client.HTTPException) as error:
+                last_error = error
+                connection.close()
+                connection = None
+        if response is None:
+            if last_error is not None:
+                raise last_error
+            raise SubscriptionError("feed connection failed")
+
+        try:
+            if response.status in {301, 302, 303, 307, 308}:
+                location = response.getheader("Location")
+                if not location or redirect_count == MAX_REDIRECTS:
+                    raise SubscriptionError("feed redirect limit exceeded")
+                current_url = urljoin(current_url, location)
+                continue
+            if response.status != 200:
+                raise SubscriptionError("feed returned an unsuccessful status")
+            return response.read(MAX_FEED_BYTES + 1)
+        finally:
+            connection.close()
+    raise SubscriptionError("feed redirect limit exceeded")
 
 
 def _fetch_feed(url, source_number):
     try:
-        _validate_public_https_url(url)
-        request = Request(url, headers={"User-Agent": "VPN-Subscription-Sync/1.0"})
-        with build_opener(_HTTPSOnlyRedirectHandler()).open(
-            request, timeout=FETCH_TIMEOUT_SECONDS
-        ) as response:
-            _validate_public_https_url(response.geturl())
-            content = response.read(MAX_FEED_BYTES + 1)
-    except (HTTPError, OSError, URLError, SubscriptionError, ValueError):
+        content = _fetch_url(url)
+    except (
+        OSError,
+        UnicodeError,
+        ssl.SSLError,
+        http.client.HTTPException,
+        SubscriptionError,
+        ValueError,
+    ):
         raise SubscriptionError(f"source {source_number} could not be fetched safely") from None
     if len(content) > MAX_FEED_BYTES:
         raise SubscriptionError(f"source {source_number} exceeds the size limit")

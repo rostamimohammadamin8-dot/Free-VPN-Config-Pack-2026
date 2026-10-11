@@ -1,11 +1,15 @@
 import base64
 import json
 import unittest
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
+from urllib.parse import urlsplit
 
 from update_sub import (
     SubscriptionError,
+    _PinnedHTTPSConnection,
     _extract_nodes,
+    _fetch_url,
+    _resolve_public_https_url,
     _validate_public_https_url,
     build_subscription,
     is_valid_node,
@@ -57,6 +61,80 @@ class SubscriptionParserTests(unittest.TestCase):
             _validate_public_https_url("https://127.0.0.1/feed")
         parsed = _validate_public_https_url("https://8.8.8.8/feed")
         self.assertEqual(parsed.scheme, "https")
+
+    def test_rejects_dns_results_that_include_private_addresses(self):
+        public_result = (None, None, None, None, ("8.8.8.8", 443))
+        private_result = (None, None, None, None, ("10.0.0.1", 443))
+        with patch(
+            "update_sub.socket.getaddrinfo",
+            return_value=[public_result, private_result],
+        ):
+            with self.assertRaises(SubscriptionError):
+                _resolve_public_https_url("https://feed.example/sub")
+
+    def test_https_connection_uses_the_validated_ip(self):
+        raw_socket = MagicMock()
+
+        class FakeContext:
+            def wrap_socket(self, connection_socket, server_hostname):
+                self.server_hostname = server_hostname
+                return connection_socket
+
+        connection = _PinnedHTTPSConnection("feed.example", "8.8.8.8", 443, 5)
+        context = FakeContext()
+        connection._context = context
+        with patch(
+            "update_sub.socket.create_connection",
+            return_value=raw_socket,
+        ) as create_connection:
+            connection.connect()
+        create_connection.assert_called_once_with(("8.8.8.8", 443), 5, None)
+        self.assertEqual(context.server_hostname, "feed.example")
+        connection.close()
+
+    def test_redirects_are_resolved_and_revalidated(self):
+        class FakeResponse:
+            def __init__(self, status, location=None, body=b""):
+                self.status = status
+                self.location = location
+                self.body = body
+
+            def getheader(self, name):
+                return self.location if name == "Location" else None
+
+            def read(self, limit):
+                return self.body
+
+        class FakeConnection:
+            def __init__(self, hostname, address, port, timeout):
+                self.hostname = hostname
+                self.requested_target = None
+
+            def request(self, method, target, headers):
+                self.requested_target = target
+
+            def getresponse(self):
+                return responses.pop(0)
+
+            def close(self):
+                pass
+
+        responses = [
+            FakeResponse(302, "https://cdn.example/subscription"),
+            FakeResponse(200, body=b"subscription"),
+        ]
+        with (
+            patch(
+                "update_sub._resolve_public_https_url",
+                side_effect=[
+                    (urlsplit("https://feed.example/start"), ["8.8.8.8"]),
+                    (urlsplit("https://cdn.example/subscription"), ["1.1.1.1"]),
+                ],
+            ) as resolve_url,
+            patch("update_sub._PinnedHTTPSConnection", FakeConnection),
+        ):
+            self.assertEqual(_fetch_url("https://feed.example/start"), b"subscription")
+        self.assertEqual(resolve_url.call_count, 2)
 
     def test_deduplicates_and_sorts_before_encoding(self):
         node_a = "vless://uuid-a@example.com:443"
