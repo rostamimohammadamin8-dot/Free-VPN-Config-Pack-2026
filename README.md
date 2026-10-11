@@ -76,6 +76,14 @@ Yes – no logs, no personal data collected.
 
 ---
 
+## 🔄 Subscription Feed
+
+The repository's `Update VPN subscription` workflow refreshes `sub.txt` every six hours. To enable it, define the `VPN_SOURCE_URLS` repository variable as one public HTTPS feed URL per line. Feeds may contain supported proxy URIs as plain text or as a Base64-encoded subscription; invalid feeds fail the workflow rather than replacing the existing subscription.
+
+The workflow validates and deduplicates nodes, sorts them for a stable result, then writes the newline-separated node list as Base64 to `sub.txt`. It commits to `main` only when the generated file changes. Run it manually from the Actions tab to refresh on demand.
+
+---
+
 ## 📌 Support
 
 ⭐ Star this repository – it helps others find this VPN config pack.  
